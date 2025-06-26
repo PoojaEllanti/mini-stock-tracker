@@ -1,0 +1,7 @@
+Flask
+yfinance
+plotly
+pandas
+scikit-learn
+requests
+beautifulsoup4
