@@ -3,12 +3,16 @@ import yfinance as yf # type: ignore
 import plotly.graph_objs as go # type: ignore
 import requests # type: ignore
 from bs4 import BeautifulSoup # type: ignore
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler # type: ignore
+from tensorflow.keras.models import Sequential # type: ignore
+from tensorflow.keras.layers import LSTM, Dense # type: ignore
 
 app = Flask(__name__)
 
 def get_stock_data(symbol):
     stock = yf.Ticker(symbol)
-    hist = stock.history(period="1mo")
+    hist = stock.history(period="6mo")
     return hist
 
 def create_chart(data, symbol):
@@ -19,12 +23,41 @@ def create_chart(data, symbol):
                       yaxis_title="Price (USD)")
     return fig.to_html(full_html=False)
 
-def predict_next_day(data):
-    # Simple moving average prediction (last 5 days)
-    if len(data) < 5:
-        return "Not enough data to predict"
-    prediction = data["Close"][-5:].mean()
-    return f"${prediction:.2f} (Simple average)"
+def prepare_lstm_data(data, sequence_length=60):
+    close_prices = data['Close'].values.reshape(-1, 1)
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(close_prices)
+
+    X, y = [], []
+    for i in range(sequence_length, len(scaled_data)):
+        X.append(scaled_data[i - sequence_length:i, 0])
+        y.append(scaled_data[i, 0])
+
+    return np.array(X), np.array(y), scaler
+
+def train_lstm_model(X, y):
+    X = X.reshape(X.shape[0], X.shape[1], 1)
+    model = Sequential([
+        LSTM(50, return_sequences=False, input_shape=(X.shape[1], 1)),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.fit(X, y, epochs=10, batch_size=16, verbose=0)
+    return model
+
+def predict_with_lstm(data):
+    if len(data) < 60:
+        return None, None, "❌ Not enough data (needs 60+ days)."
+
+    X, y, scaler = prepare_lstm_data(data)
+    model = train_lstm_model(X, y)
+
+    last_sequence = X[-1].reshape(1, X.shape[1], 1)
+    predicted_scaled = model.predict(last_sequence)[0][0]
+    predicted_price = scaler.inverse_transform([[predicted_scaled]])[0][0]
+
+    actual_price = data['Close'].iloc[-1]
+    return actual_price, predicted_price, None
 
 def get_news(symbol):
     news = []
@@ -42,7 +75,7 @@ def get_news(symbol):
                 })
     except Exception as e:
         print(f"[ERROR] Failed to fetch news: {e}")
-    return news  # Always return a list
+    return news
 
 @app.route("/", methods=['GET', 'POST'])
 def index():
@@ -51,9 +84,22 @@ def index():
     if request.method == 'POST':
         symbol = request.form['symbol'].upper()
         df = get_stock_data(symbol)
-        chart = create_chart(df, symbol)
-        prediction = predict_next_day(df)
-        news = get_news(symbol)
+
+        if df.empty or 'Close' not in df.columns or df['Close'].dropna().empty:
+            prediction = "❌ Unable to fetch stock data. Please try another symbol."
+            chart = None
+            news = []
+        else:
+            chart = create_chart(df, symbol)
+            actual, predicted, error = predict_with_lstm(df)
+
+            if error:
+                last_price = df['Close'].dropna().iloc[-1]
+                prediction = f"📉 Latest Price: ${last_price:.2f} (LSTM prediction not available)"
+            else:
+                prediction = f"📈 Actual: ${actual:.2f} | 🤖 Predicted: ${predicted:.2f}"
+
+            news = get_news(symbol)
 
     return render_template("index.html", chart=chart, news=news or [], prediction=prediction, symbol=symbol)
 
